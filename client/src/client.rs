@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{de, Value};
 use std::{
   collections::HashMap,
+  error::Error,
   io::{self, BufRead, BufReader, Write},
   net::TcpStream,
   thread,
@@ -29,6 +30,7 @@ pub struct Channel {
 pub struct Client {
   servers_info: Vec<ServerInfo>,
   server_idx: usize,
+  verbose: bool,
   state: Option<ClientState>,
   sid: u64,
   subscriptions: HashMap<u64, Subscription>,
@@ -51,6 +53,7 @@ impl Client {
     Ok(Client {
       servers_info,
       server_idx: 0,
+      verbose: true,
       state: None,
       sid: 1,
       subscriptions: HashMap::new(),
@@ -96,6 +99,13 @@ impl Client {
     })
   }
 
+  fn restore_subscriptions(&mut self) -> Result<(), NatsClientError> {
+    for (sid, sub) in self.subscriptions.clone() {
+      self.subscribe_with_sid(sid, &sub)?;
+    }
+    Ok(())
+  }
+
   fn with_reconnect<F, T>(&mut self, f: F) -> Result<T, NatsClientError>
   where
     F: Fn(&mut ClientState) -> Result<T, NatsClientError>,
@@ -104,9 +114,34 @@ impl Client {
       Err(NatsClientError::from((ErrorKind::IoError, "I/O error")));
     for _ in 0..RETRIES_MAX {
       let mut state = self.state.take().unwrap();
-      res = f(&mut state);
+      res = match f(&mut state) {
+        e @ Err(_) => {
+          if let Err(e) = self.reconnect() {
+            return Err(e);
+          };
+          if let Err(e) = self.restore_subscriptions() {
+            return Err(NatsClientError::from((
+              ClientProtocolError,
+              "Failed to restore subscriptions",
+              e.description().to_owned(),
+            )));
+          }
+          e
+        }
+        res @ Ok(_) => {
+          self.state = Some(state);
+          return res;
+        }
+      };
     }
     res
+  }
+
+  fn reconnect(&mut self) -> Result<(), NatsClientError> {
+    if let Some(mut state) = self.state.take() {
+      let _ = state.stream_writer.flush();
+    }
+    self.connect()
   }
 
   fn connect_if_needed(&mut self) -> Result<(), NatsClientError> {
@@ -174,24 +209,53 @@ impl Client {
       )))
     })?;
     // TODO: max_payload/auth/tls
-    let connect = ConnectNoCredentials {};
+    let connect = ConnectNoCredentials {
+      verbose: self.verbose,
+      pedantic: true,
+      name: "binlogo".to_string(),
+    };
     let connect_json = serde_json::to_string(&connect).unwrap();
     let connect_string = format!("CONNECT {}\nPING\n", connect_json);
     let connect_bytes = connect_string.as_bytes();
     stream_writer.write_all(connect_bytes).unwrap();
 
+    println!("CONNECT write done. {}", connect_string);
+
+    if self.verbose {
+      let mut line = String::new();
+      match buf_reader.read_line(&mut line) {
+        Ok(line_len) if line_len != "+OK\r\n".len() => {
+          return Err(NatsClientError::from(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unexpected EOF",
+          )))
+        }
+        Err(e) => return Err(NatsClientError::from(e)),
+        Ok(_) => {}
+      };
+      if line != "+OK\r\n" {
+        return Err(NatsClientError::from(io::Error::new(
+          io::ErrorKind::InvalidInput,
+          "Server +OK not received",
+        )));
+      }
+    }
+
     let mut line = String::new();
     match buf_reader.read_line(&mut line) {
       Ok(line_len) if line_len != "PONG\r\n".len() => {
+        println!("Unexpected EOF, {}", line_len);
         return Err(NatsClientError::from(io::Error::new(
           io::ErrorKind::InvalidInput,
           "Unexpected EOF",
-        )))
+        )));
       }
       Err(e) => return Err(NatsClientError::from(e)),
       Ok(_) => (),
     };
+
     if line != "PONG\r\n" {
+      println!("Server PONG not received, but: {}", line);
       return Err(NatsClientError::from(io::Error::new(
         io::ErrorKind::InvalidInput,
         "Server PONG not received",
@@ -203,6 +267,7 @@ impl Client {
       buf_reader,
     };
     self.state = Some(state);
+    println!("Connected success");
     Ok(())
   }
 }
@@ -215,7 +280,11 @@ struct ServerInfo {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ConnectNoCredentials {}
+struct ConnectNoCredentials {
+  verbose: bool,
+  pedantic: bool,
+  name: String,
+}
 
 #[derive(Debug)]
 struct ClientState {
@@ -236,6 +305,12 @@ pub trait ToStringVec {
 impl ToStringVec for &str {
   fn to_string_vec(self) -> Vec<String> {
     vec![self.to_string()]
+  }
+}
+
+impl ToStringVec for String {
+  fn to_string_vec(self) -> Vec<String> {
+    vec![self]
   }
 }
 

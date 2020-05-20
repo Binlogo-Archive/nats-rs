@@ -1,4 +1,4 @@
-use std::io;
+use std::{error::Error, fmt, io};
 use url;
 
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
@@ -22,6 +22,39 @@ enum ErrorRepr {
 #[derive(Debug)]
 pub struct NatsClientError {
   repr: ErrorRepr,
+}
+
+impl Error for NatsClientError {
+  fn description(&self) -> &str {
+    match self.repr {
+      ErrorRepr::WithDescription(_, description)
+      | ErrorRepr::WithDescriptionAndDetail(_, description, _) => description,
+      ErrorRepr::IoError(ref e) => e.description(),
+      ErrorRepr::UrlParseError(ref e) => e.description(),
+    }
+  }
+
+  fn cause(&self) -> Option<&dyn Error> {
+    match self.repr {
+      ErrorRepr::IoError(ref e) => Some(e as &dyn Error),
+      _ => None,
+    }
+  }
+}
+
+impl fmt::Display for NatsClientError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+    match self.repr {
+      ErrorRepr::WithDescription(_, description) => description.fmt(f),
+      ErrorRepr::WithDescriptionAndDetail(_, description, ref detail) => {
+        description.fmt(f)?;
+        f.write_str(": ")?;
+        detail.fmt(f)
+      }
+      ErrorRepr::IoError(ref e) => e.fmt(f),
+      ErrorRepr::UrlParseError(ref e) => e.fmt(f),
+    }
+  }
 }
 
 impl From<(ErrorKind, &'static str)> for NatsClientError {
