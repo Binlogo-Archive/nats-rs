@@ -27,6 +27,19 @@ pub struct Channel {
 }
 
 #[derive(Debug)]
+pub struct Event {
+  pub subject: String,
+  pub channel: Channel,
+  pub msg: Vec<u8>,
+  pub inbox: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct Events<'a> {
+  client: &'a mut Client,
+}
+
+#[derive(Debug)]
 pub struct Client {
   servers_info: Vec<ServerInfo>,
   server_idx: usize,
@@ -58,6 +71,10 @@ impl Client {
       sid: 1,
       subscriptions: HashMap::new(),
     })
+  }
+
+  pub fn events(&mut self) -> Events<'_> {
+    Events { client: self }
   }
 
   pub fn subscribe(
@@ -96,6 +113,38 @@ impl Client {
       state.stream_writer.write_all(cmd.as_bytes())?;
       wait_ok(&mut state)?;
       Ok(Channel { sid })
+    })
+  }
+
+  fn wait(&mut self) -> Result<Event, NatsClientError> {
+    self.connect_if_needed()?;
+    self.with_reconnect(|state| -> Result<Event, NatsClientError> {
+      let buf_reader = &mut state.buf_reader;
+      loop {
+        let mut line = String::new();
+        match buf_reader.read_line(&mut line) {
+          Ok(line_len) if line_len < "PING\r\n".len() => {
+            return Err(NatsClientError::from((
+              ErrorKind::ServerProtocolError,
+              "Incomplete server response",
+            )))
+          }
+          Err(e) => return Err(NatsClientError::from(e)),
+          Ok(_) => (),
+        }
+        if line.starts_with("MSG ") {
+          unimplemented!() // TODO
+        }
+        if line != "PING\r\n" {
+          return Err(NatsClientError::from((
+            ErrorKind::ServerProtocolError,
+            "Server sent an unexpected response",
+            line,
+          )));
+        }
+        let cmd = "PONG\r\n";
+        state.stream_writer.write_all(cmd.as_bytes())?;
+      }
     })
   }
 
@@ -311,6 +360,15 @@ impl ToStringVec for &str {
 impl ToStringVec for String {
   fn to_string_vec(self) -> Vec<String> {
     vec![self]
+  }
+}
+
+impl<'a> Iterator for Events<'a> {
+  type Item = Event;
+
+  fn next(&mut self) -> Option<Event> {
+    let nc = &mut self.client;
+    nc.wait().ok().map(|event| event)
   }
 }
 

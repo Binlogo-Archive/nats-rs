@@ -37,6 +37,12 @@ fn main() -> CliResult {
         Command::Sub { subject } => {
             let sub = nc.subscribe(&subject, None).unwrap();
             println!("Listening on {}", subject);
+            for event in nc.events() {
+                println!(
+                    "Received {}",
+                    String::from_utf8(event.msg).expect("Not utf8 encoded")
+                );
+            }
         }
         _ => {
             unimplemented!() // TODO
